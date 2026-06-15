@@ -333,3 +333,5 @@ Possible future improvements:
 MIT License
 
 You are free to use, modify, and distribute this project.
+<img width="2560" height="1392" alt="image" src="https://github.com/user-attachments/assets/512135d6-c077-49da-a9de-3ed754a4981a" />
+<img width="2250" height="1232" alt="image" src="https://github.com/user-attachments/assets/919fb68a-8693-46e9-b6b3-f5467a6ca30e" />
