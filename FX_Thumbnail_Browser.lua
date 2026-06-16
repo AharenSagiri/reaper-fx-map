@@ -90,6 +90,8 @@ local img_slot_next = 0
 local CAPTURE_WAIT_SECONDS = 1.0
 local CAPTURE_TIMEOUT_SECONDS = 5.0
 local TEMP_CAPTURE_TRACK_NAME = "FX Map Thumbnail Capture"
+local CAPTURE_PLUGIN_TOP_CROP = 30
+local CAPTURE_FALLBACK_TOP_CROP = 64
 
 ------------------------------------------------------------
 -- Runtime state
@@ -131,6 +133,7 @@ local group_rules = {}  -- { group, keywords[] }
 local capture_job = nil
 local status_message = ""
 local status_until = 0
+local thumbnail_reload_at = nil
 
 ------------------------------------------------------------
 -- Sidebar filter lists
@@ -780,6 +783,8 @@ local function load_thumb(fx)
   local slot = img_slot_next
   img_slot_next = img_slot_next + 1
 
+  -- Force slot reuse to read the current file from disk after a screenshot.
+  gfx.loadimg(slot, "")
   local loaded = gfx.loadimg(slot, fx.thumb_file)
   fx.img = (loaded == -1) and -1 or slot
   return fx.img
@@ -787,10 +792,26 @@ end
 
 --- Reset all cached image slots (e.g. after thumbnails were regenerated).
 local function reload_thumbnails()
+  for slot = 0, img_slot_next - 1 do
+    gfx.loadimg(slot, "")
+  end
+
   img_slot_next = 0
   for _, fx in ipairs(fxs) do
     fx.img = nil
   end
+end
+
+local function schedule_thumbnail_reload(delay)
+  thumbnail_reload_at = reaper.time_precise() + (delay or 0.15)
+end
+
+local function update_thumbnail_reload()
+  if not thumbnail_reload_at then return end
+  if reaper.time_precise() < thumbnail_reload_at then return end
+
+  thumbnail_reload_at = nil
+  reload_thumbnails()
 end
 
 ------------------------------------------------------------
@@ -798,7 +819,10 @@ end
 ------------------------------------------------------------
 
 local function capture_api_available()
-  return reaper.JS_Window_GetRect
+  return reaper.new_array
+    and reaper.JS_Window_GetRect
+    and reaper.JS_Window_ArrayAllChild
+    and reaper.JS_Window_HandleFromAddress
     and reaper.JS_Window_SetForeground
     and reaper.JS_Window_SetFocus
     and reaper.JS_GDI_GetWindowDC
@@ -848,26 +872,84 @@ local function cleanup_capture_job(job)
   reaper.UpdateArrange()
 end
 
-local function capture_window_to_png(hwnd, filename)
+local function get_window_rect(hwnd)
   local ok, left, top, right, bottom = reaper.JS_Window_GetRect(hwnd)
-  if not ok then
-    return false, "无法读取插件窗口尺寸。"
+  if not ok then return nil end
+  return {
+    left = left,
+    top = top,
+    right = right,
+    bottom = bottom,
+    w = right - left,
+    h = bottom - top,
+  }
+end
+
+local function find_plugin_child_window(parent_hwnd)
+  local parent = get_window_rect(parent_hwnd)
+  if not parent or parent.w <= 0 or parent.h <= 0 then return nil end
+
+  local arr = reaper.new_array({}, 512)
+  reaper.JS_Window_ArrayAllChild(parent_hwnd, arr)
+  local addresses = arr.table()
+
+  local best_inner_hwnd = nil
+  local best_inner_area = 0
+  local best_wrapper_hwnd = nil
+  local best_wrapper_area = 0
+  local parent_area = parent.w * parent.h
+
+  for _, address in ipairs(addresses) do
+    local child = reaper.JS_Window_HandleFromAddress(address)
+    local rect = child and get_window_rect(child)
+
+    if rect and rect.w > 0 and rect.h > 0 then
+      local inside_parent =
+        rect.left >= parent.left
+        and rect.top >= parent.top
+        and rect.right <= parent.right
+        and rect.bottom <= parent.bottom
+
+      local area = rect.w * rect.h
+      local looks_like_plugin_wrapper =
+        inside_parent
+        and area > parent_area * 0.20
+        and rect.w > parent.w * 0.45
+        and rect.h > parent.h * 0.45
+        and rect.top > parent.top + 28
+
+      local looks_like_plugin_canvas =
+        inside_parent
+        and area > parent_area * 0.12
+        and rect.w > parent.w * 0.40
+        and rect.h > parent.h * 0.35
+        and rect.top > parent.top + 52
+
+      if looks_like_plugin_canvas and area > best_inner_area then
+        best_inner_hwnd = child
+        best_inner_area = area
+      end
+
+      if looks_like_plugin_wrapper and area > best_wrapper_area then
+        best_wrapper_hwnd = child
+        best_wrapper_area = area
+      end
+    end
   end
 
-  local src_x = 0
-  local src_y = 0
-  local w = right - left
-  local h = bottom - top
+  if best_inner_hwnd then
+    return best_inner_hwnd, false
+  end
+
+  return best_wrapper_hwnd, best_wrapper_hwnd ~= nil
+end
+
+local function capture_window_region_to_png(hwnd, filename, src_x, src_y, w, h)
+  src_x = src_x or 0
+  src_y = src_y or 0
 
   if w <= 0 or h <= 0 then
     return false, "插件窗口尺寸无效。"
-  end
-
-  -- Windows 10/11 会把不可见边框计入窗口矩形；裁掉后缩略图更干净。
-  if lower(reaper.GetOS()):find("win") then
-    src_x = 8
-    w = math.max(1, w - 16)
-    h = math.max(1, h - 8)
   end
 
   reaper.JS_Window_SetForeground(hwnd)
@@ -904,6 +986,37 @@ local function capture_window_to_png(hwnd, filename)
   return false, "截图文件没有写入。"
 end
 
+local function capture_window_to_png(hwnd, filename)
+  local target_hwnd, needs_plugin_top_crop = find_plugin_child_window(hwnd)
+  target_hwnd = target_hwnd or hwnd
+  local rect = get_window_rect(target_hwnd)
+  if not rect then
+    return false, "无法读取插件窗口尺寸。"
+  end
+
+  local src_x = 0
+  local src_y = 0
+  local w = rect.w
+  local h = rect.h
+
+  if target_hwnd ~= hwnd and needs_plugin_top_crop then
+    -- Some child windows still include REAPER's preset/Param/UI strip.
+    src_y = CAPTURE_PLUGIN_TOP_CROP
+    h = math.max(1, h - CAPTURE_PLUGIN_TOP_CROP)
+  elseif target_hwnd == hwnd then
+    -- Fallback only: when no plugin child window is exposed, avoid REAPER's
+    -- title/preset wrapper by cropping the top of the floating FX window.
+    if lower(reaper.GetOS()):find("win") then
+      src_x = 8
+      src_y = CAPTURE_FALLBACK_TOP_CROP
+      w = math.max(1, w - 16)
+      h = math.max(1, h - CAPTURE_FALLBACK_TOP_CROP - 8)
+    end
+  end
+
+  return capture_window_region_to_png(target_hwnd, filename, src_x, src_y, w, h)
+end
+
 local function finish_capture_job(ok, message)
   local job = capture_job
   capture_job = nil
@@ -911,7 +1024,9 @@ local function finish_capture_job(ok, message)
   cleanup_capture_job(job)
 
   if ok then
+    job.fx.img = nil
     reload_thumbnails()
+    schedule_thumbnail_reload(0.15)
     set_status("截图已保存：" .. job.fx.thumb_name, 3)
   else
     set_status(message or "截图失败。", 4)
@@ -1720,6 +1835,7 @@ end
 local function draw_ui()
   handle_mouse_wheel()
   update_capture_job()
+  update_thumbnail_reload()
 
   -- Background
   draw_color_rect(0, 0, gfx.w, gfx.h, C.bg, 1, true)
