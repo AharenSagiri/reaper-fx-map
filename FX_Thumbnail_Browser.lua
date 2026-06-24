@@ -7,7 +7,7 @@
 --   * Collapsible sidebar sections with persistent state
 --   * Thumbnail grid with lazy image loading
 --   * Per-card "Shot" button to capture a plugin GUI into the thumbnail cache
---   * Right-click context menu: add FX, toggle favorite, assign manual group
+--   * Right-click context menu: add FX, toggle favorite, assign manual group, resize cards
 --   * Double-click to add FX to selected track
 --   * Persistent data: favorites, manual groups, auto-group rules
 --   * Single-instance enforcement with toolbar toggle sync
@@ -48,11 +48,40 @@ local SIDEBAR_HEADER_H = 26
 local SIDEBAR_SECTION_GAP = 12
 local SCROLLBAR_W = 7
 
--- Plugin cards / thumbnails
-local CARD_W = 440
-local CARD_H = 284
-local THUMB_H = 252
-local PAD = 18
+-- Plugin cards / thumbnails. Large is the 100% reference size.
+local BASE_CARD_W = 440
+local BASE_CARD_H = 284
+local BASE_THUMB_H = 252
+local BASE_PAD = 18
+
+local SIZE_MIN_SCALE = 0.50
+local SIZE_MAX_SCALE = 1.50
+local SIZE_WHEEL_STEP = 0.10
+
+local SIZE_PRESETS = {
+  { label = "Small", scale = 0.50 },
+  { label = "Medium", scale = 0.75 },
+  { label = "Large", scale = 1.00 },
+  { label = "ExLarge", scale = 1.50 },
+}
+
+local card_size_scale = tonumber(reaper.GetExtState(SECTION, "card_size_scale")) or 1.00
+if card_size_scale < SIZE_MIN_SCALE then card_size_scale = SIZE_MIN_SCALE end
+if card_size_scale > SIZE_MAX_SCALE then card_size_scale = SIZE_MAX_SCALE end
+
+local CARD_W = BASE_CARD_W
+local CARD_H = BASE_CARD_H
+local THUMB_H = BASE_THUMB_H
+local PAD = BASE_PAD
+
+local function apply_card_size_scale()
+  CARD_W = math.floor(BASE_CARD_W * card_size_scale + 0.5)
+  CARD_H = math.floor(BASE_CARD_H * card_size_scale + 0.5)
+  THUMB_H = math.floor(BASE_THUMB_H * card_size_scale + 0.5)
+  PAD = math.max(10, math.floor(BASE_PAD * card_size_scale + 0.5))
+end
+
+apply_card_size_scale()
 
 -- Modern flat black/gray theme
 local RADIUS_SM = 5
@@ -85,6 +114,7 @@ local WHEEL_STEP_GRID = 80
 -- gfx image slots are limited (0–1023); allocate on demand
 local MAX_IMG_SLOTS = 1023
 local img_slot_next = 0
+local RESCAN_CHUNK_SIZE = 40
 
 -- FX thumbnail capture
 local CAPTURE_WAIT_SECONDS = 1.0
@@ -114,6 +144,7 @@ local sidebar_scroll = 0
 -- Click / double-click tracking
 local mouse_down_prev = false
 local right_down_prev = false
+local context_menu_opened_this_frame = false
 local last_click_time = 0
 local last_click_key = ""
 
@@ -134,6 +165,7 @@ local capture_job = nil
 local status_message = ""
 local status_until = 0
 local thumbnail_reload_at = nil
+local rescan_job = nil
 
 ------------------------------------------------------------
 -- Sidebar filter lists
@@ -268,6 +300,60 @@ end
 
 local function status_is_active()
   return status_message ~= "" and reaper.time_precise() < status_until
+end
+
+local function size_percent_label(scale)
+  return tostring(math.floor((scale or card_size_scale) * 100 + 0.5)) .. "%"
+end
+
+local function set_card_size_scale(scale)
+  local next_scale = clamp(scale, SIZE_MIN_SCALE, SIZE_MAX_SCALE)
+  next_scale = math.floor(next_scale * 100 + 0.5) / 100
+
+  if math.abs(next_scale - card_size_scale) < 0.001 then
+    return
+  end
+
+  card_size_scale = next_scale
+  apply_card_size_scale()
+  reaper.SetExtState(SECTION, "card_size_scale", string.format("%.2f", card_size_scale), true)
+  scroll = math.max(0, scroll)
+  set_status("Display size changed.", 1.4)
+end
+
+local function set_card_size_preset(index)
+  local preset = SIZE_PRESETS[index]
+  if preset then
+    set_card_size_scale(preset.scale)
+  end
+end
+
+local function card_size_menu_label(preset)
+  local label = "Size: " .. preset.label .. " (" .. size_percent_label(preset.scale) .. ")"
+  if math.abs(card_size_scale - preset.scale) < 0.001 then
+    label = "!" .. label
+  end
+  return label
+end
+
+local function append_card_size_menu(menu)
+  for _, preset in ipairs(SIZE_PRESETS) do
+    menu = menu .. "|" .. card_size_menu_label(preset)
+  end
+  return menu
+end
+
+local function show_card_size_menu()
+  local menu = ""
+  for i, preset in ipairs(SIZE_PRESETS) do
+    if i > 1 then menu = menu .. "|" end
+    menu = menu .. card_size_menu_label(preset)
+  end
+
+  gfx.x = gfx.mouse_x
+  gfx.y = gfx.mouse_y
+  local choice = gfx.showmenu(menu)
+  set_card_size_preset(choice)
 end
 
 --- Sanitize an FX identifier into a safe filename for thumbnail storage.
@@ -549,6 +635,29 @@ end
 -- FX enumeration
 ------------------------------------------------------------
 
+local function build_fx_entry(name, ident)
+  local key = ident ~= "" and ident or name
+  local fx_type, is_instrument = parse_fx_type(name)
+  local vendor = parse_vendor_from_fx_name(name)
+  local display_name = clean_plugin_display_name(name)
+  local filename = sanitize_filename(key) .. ".png"
+
+  return {
+    name = name,
+    vendor = vendor,
+    display_name = display_name,
+    ident = ident or "",
+    key = key,
+    fx_type = fx_type,
+    is_instrument = is_instrument,
+    thumb_file = THUMB_DIR .. SEP .. filename,
+    thumb_name = filename,
+    img = nil,           -- lazy-loaded gfx slot (nil = not tried, -1 = failed)
+    auto_group = "Other",
+    group = "Other",
+  }
+end
+
 --- Enumerate all installed FX via the REAPER API and build the `fxs` table.
 local function enum_fx()
   fxs = {}
@@ -560,27 +669,7 @@ local function enum_fx()
     local ok, name, ident = reaper.EnumInstalledFX(i)
     if not ok then break end
 
-    local key = ident ~= "" and ident or name
-    local fx_type, is_instrument = parse_fx_type(name)
-    local vendor = parse_vendor_from_fx_name(name)
-    local display_name = clean_plugin_display_name(name)
-    local filename = sanitize_filename(key) .. ".png"
-
-    table.insert(fxs, {
-      name = name,
-      vendor = vendor,
-      display_name = display_name,
-      ident = ident or "",
-      key = key,
-      fx_type = fx_type,
-      is_instrument = is_instrument,
-      thumb_file = THUMB_DIR .. SEP .. filename,
-      thumb_name = filename,
-      img = nil,           -- lazy-loaded gfx slot (nil = not tried, -1 = failed)
-      auto_group = "Other",
-      group = "Other",
-    })
-
+    table.insert(fxs, build_fx_entry(name, ident))
     i = i + 1
   end
 
@@ -812,6 +901,60 @@ local function update_thumbnail_reload()
 
   thumbnail_reload_at = nil
   reload_thumbnails()
+end
+
+local function finish_rescan_fx()
+  reload_thumbnails()
+
+  table.sort(rescan_job.items, function(a, b) return lower(a.name) < lower(b.name) end)
+  fxs = rescan_job.items
+  filtered = {}
+  scroll = 0
+  img_slot_next = 0
+
+  rebuild_groups()
+  rebuild_vendor_filters()
+  apply_filter()
+
+  set_status("Rescan complete: " .. tostring(#fxs) .. " FX", 3)
+  rescan_job = nil
+end
+
+local function start_rescan_fx()
+  if rescan_job then
+    set_status("Rescan already running.", 2)
+    return
+  end
+
+  rescan_job = {
+    index = 0,
+    items = {},
+    previous_total = math.max(#fxs, 1),
+  }
+
+  set_status("Rescanning FX...", 2)
+end
+
+local function update_rescan_fx_job()
+  if not rescan_job then return end
+
+  for _ = 1, RESCAN_CHUNK_SIZE do
+    local ok, name, ident = reaper.EnumInstalledFX(rescan_job.index)
+    if not ok then
+      finish_rescan_fx()
+      return
+    end
+
+    table.insert(rescan_job.items, build_fx_entry(name, ident))
+    rescan_job.index = rescan_job.index + 1
+  end
+end
+
+local function rescan_progress()
+  if not rescan_job then return 0 end
+
+  local denominator = math.max(rescan_job.previous_total, rescan_job.index + 1)
+  return clamp(rescan_job.index / denominator, 0, 0.98)
 end
 
 ------------------------------------------------------------
@@ -1520,6 +1663,17 @@ end
 -- Top bar
 ------------------------------------------------------------
 
+local function draw_progress_bar(x, y, w, h, progress)
+  progress = clamp(progress or 0, 0, 1)
+
+  draw_round_rect(x, y, w, h, math.floor(h * 0.5), C.stroke_soft, 1, true)
+
+  local fill_w = math.floor(w * progress)
+  if fill_w > 0 then
+    draw_round_rect(x, y, fill_w, h, math.floor(h * 0.5), C.accent, 1, true)
+  end
+end
+
 local function draw_top_bar()
   draw_color_rect(0, 0, gfx.w, TOP_H, C.top, 1, true)
   draw_color_rect(0, TOP_H - 1, gfx.w, 1, C.stroke_soft, 1, true)
@@ -1536,12 +1690,13 @@ local function draw_top_bar()
   x = x + 72
   if draw_button("Reload", x, y, 74, 30, false) then
     reload_thumbnails()
+    schedule_thumbnail_reload(0.15)
+    set_status("Thumbnails reloaded.", 2.5)
   end
 
   x = x + 82
-  if draw_button("Rescan FX", x, y, 96, 30, false) then
-    enum_fx()
-    apply_filter()
+  if draw_button(rescan_job and "Scanning" or "Rescan FX", x, y, 96, 30, rescan_job ~= nil) then
+    start_rescan_fx()
   end
 
   -- Filtered / total count
@@ -1558,6 +1713,9 @@ local function draw_top_bar()
   if capture_job then
     info = "Capturing thumbnail: " .. capture_job.fx.display_name
     info_r, info_g, info_b = C.warning[1], C.warning[2], C.warning[3]
+  elseif rescan_job then
+    info = "Rescanning FX: " .. tostring(rescan_job.index) .. " scanned"
+    info_r, info_g, info_b = C.warning[1], C.warning[2], C.warning[3]
   elseif status_is_active() then
     info = status_message
     info_r, info_g, info_b = C.accent[1], C.accent[2], C.accent[3]
@@ -1565,10 +1723,16 @@ local function draw_top_bar()
     info = "Filter: " .. active_filter_label()
   end
 
-  if #info > 90 then
-    info = info:sub(1, 87) .. "..."
+  local size_info = "Size: " .. size_percent_label()
+  local max_info_len = math.max(20, 90 - #size_info - 3)
+  if #info > max_info_len then
+    info = info:sub(1, max_info_len - 3) .. "..."
   end
-  draw_text(info, UI_MARGIN, 48, info_r, info_g, info_b, 1)
+  draw_text(info .. "   " .. size_info, UI_MARGIN, 48, info_r, info_g, info_b, 1)
+
+  if rescan_job then
+    draw_progress_bar(UI_MARGIN, TOP_H - 7, 350, 3, rescan_progress())
+  end
 end
 
 ------------------------------------------------------------
@@ -1678,12 +1842,18 @@ local function draw_card(fx, index, x, y)
 
   -- ── Right-click context menu ──
   if hover and right_clicked() then
+    context_menu_opened_this_frame = true
+
+    local groups_without_all = {}
     local menu = "Add FX|Capture Thumbnail|Toggle Favorite|Group: Auto"
     for _, g in ipairs(group_filters) do
       if g ~= "All" then
+        table.insert(groups_without_all, g)
         menu = menu .. "|Group: " .. g
       end
     end
+    local size_choice_start = 5 + #groups_without_all
+    menu = append_card_size_menu(menu)
 
     gfx.x = gfx.mouse_x
     gfx.y = gfx.mouse_y
@@ -1700,21 +1870,16 @@ local function draw_card(fx, index, x, y)
       set_manual_group(fx, "Auto")
       rebuild_groups()
       apply_filter()
-    elseif choice >= 5 then
+    elseif choice >= 5 and choice < size_choice_start then
       -- Map menu index back to the group name (skipping "All" at position 1)
-      local group_index = choice - 4
-      local groups_without_all = {}
-      for _, g in ipairs(group_filters) do
-        if g ~= "All" then
-          table.insert(groups_without_all, g)
-        end
-      end
-      local group = groups_without_all[group_index]
+      local group = groups_without_all[choice - 4]
       if group then
         set_manual_group(fx, group)
         rebuild_groups()
         apply_filter()
       end
+    elseif choice >= size_choice_start then
+      set_card_size_preset(choice - size_choice_start + 1)
     end
     return
   end
@@ -1773,11 +1938,24 @@ end
 -- Mouse wheel
 ------------------------------------------------------------
 
+local function draw_global_context_menu()
+  if context_menu_opened_this_frame then return end
+  if not right_clicked() then return end
+
+  context_menu_opened_this_frame = true
+  show_card_size_menu()
+end
+
 local function handle_mouse_wheel()
   if gfx.mouse_wheel == 0 then return end
 
   local wheel = gfx.mouse_wheel
   gfx.mouse_wheel = 0
+
+  if (gfx.mouse_cap & 4) == 4 then
+    set_card_size_scale(card_size_scale + (wheel / 120) * SIZE_WHEEL_STEP)
+    return
+  end
 
   -- Top bar does not scroll
   if gfx.mouse_y < TOP_H then return end
@@ -1833,9 +2011,12 @@ end
 ------------------------------------------------------------
 
 local function draw_ui()
+  context_menu_opened_this_frame = false
+
   handle_mouse_wheel()
   update_capture_job()
   update_thumbnail_reload()
+  update_rescan_fx_job()
 
   -- Background
   draw_color_rect(0, 0, gfx.w, gfx.h, C.bg, 1, true)
@@ -1845,6 +2026,7 @@ local function draw_ui()
   draw_grid_scrollbar()
   draw_sidebar()
   draw_top_bar()
+  draw_global_context_menu()
 
   -- Store button state for edge detection next frame
   mouse_down_prev = (gfx.mouse_cap & 1) == 1
